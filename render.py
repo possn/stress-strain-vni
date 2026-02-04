@@ -1,220 +1,277 @@
+# render_strain_crf_vni.py
+# Vídeo 16:9 (60s) — stress/strain, CRF e papel da VNI
+# FIX pedido: o TEXTO (painel esquerdo) está todo “em bloco” e pode ser deslocado mudando só X_PANEL.
+# Requisitos: pip install matplotlib imageio
+
 import os
 os.environ["MPLBACKEND"] = "Agg"
 
 import numpy as np
 import matplotlib.pyplot as plt
 import imageio.v2 as imageio
-import matplotlib.image as mpimg
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, FancyBboxPatch
 
 # =========================
-# CONFIG
+# OUTPUT / VIDEO
 # =========================
 OUT = "stress_strain_vni.mp4"
 FPS = 20
 DURATION_S = 60
+
 W, H = 12.8, 7.2
 DPI = 120
 
-LUNG_IMG = "lung_realistic.png.PNG"
+# =========================
+# ASSET
+# =========================
+LUNG_IMG = "lung_realistic.png.PNG"  # usa exactamente este nome (como tens no GitHub)
 
-# Didáctico
-VT_L = 0.45
-CRF_OK_L = 2.5
-CRF_LOW_L = 1.0
+# =========================
+# LAYOUT — MUDA SÓ ISTO
+# =========================
+# Painel de texto "em bloco" (esquerda). Se houver sobreposição, mexe só aqui.
+X_PANEL = 0.08     # <- desloca tudo para a direita/esquerda
+Y_TOP   = 0.80
 
-# Barra strain (didáctico)
-SAFE_LIMIT = 0.25
-ST_MAX_BAR = 0.60  # topo da barra
+# Zonas reservadas:
+# - Texto: x in [X_PANEL .. X_PANEL+PANEL_W]
+# - Pulmão: centro
+# - Barra strain: direita
+PANEL_W = 0.40
+BAR_X0  = 0.86  # barra strain (direita)
+BAR_W   = 0.06
+BAR_Y0  = 0.22
+BAR_H   = 0.58
 
-def strain(vt, crf):
-    return vt / crf
+# =========================
+# DIDÁTICA (valores)
+# =========================
+VT_L = 0.45                 # 450 mL
+CRF_HEALTHY = 2.5           # L
+CRF_LOW = 1.0               # L
+CRF_VNI_TARGET = 1.8        # L (exemplo: VNI/PEEP sobe CRF/recruta)
 
-def phase(t):
-    # 0-20: saudável
-    # 20-40: CRF baixa (lesão)
-    # 40-60: VNI aumenta CRF efectiva (recrutamento)
-    if t < 20:
-        return "ok"
-    if t < 40:
-        return "low"
-    return "vni"
+SAFE_STRAIN = 0.25          # limite didático (não é "lei"; serve para semáforo)
 
-def smooth01(x):
-    x = np.clip(x, 0.0, 1.0)
+# =========================
+# TIMELINE (60s)
+# =========================
+# 0–20s: saudável
+# 20–40s: CRF baixa + “falha provável”
+# 40–60s: VNI ↑CRF → strain baixa
+T1, T2, T3 = 20.0, 40.0, 60.0
+
+# =========================
+# Helpers
+# =========================
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+def smoothstep(x):
+    x = clamp(x, 0.0, 1.0)
     return 0.5 - 0.5*np.cos(np.pi*x)
 
-def load_lung():
-    if not os.path.exists(LUNG_IMG):
-        raise FileNotFoundError(f"Imagem não encontrada: {LUNG_IMG}")
-    return mpimg.imread(LUNG_IMG)
+def lerp(a, b, t):
+    return a + (b - a)*t
 
-lung_img = load_lung()
-ih, iw = lung_img.shape[0], lung_img.shape[1]
-aspect = iw / ih
+def strain(vt, v0):
+    return vt / max(v0, 1e-9)
 
+def canvas_to_rgb(fig):
+    fig.canvas.draw()
+    return np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+
+def load_lung(path):
+    if os.path.exists(path):
+        return plt.imread(path)
+    return None
+
+LUNG = load_lung(LUNG_IMG)
+
+def draw_strain_bar(ax, s, x0=BAR_X0, y0=BAR_Y0, w=BAR_W, h=BAR_H, safe=SAFE_STRAIN):
+    # fundo
+    ax.add_patch(Rectangle((x0, y0), w, h, fill=False, lw=2.0, edgecolor="#111827"))
+
+    # zonas (verde seguro / vermelho acima)
+    safe_frac = clamp(safe / 0.60, 0.0, 1.0)  # escala até 0.60 (didático)
+    y_safe = y0 + h*safe_frac
+
+    ax.add_patch(Rectangle((x0, y0), w, y_safe - y0, facecolor="#dcfce7", edgecolor="none", alpha=0.95))
+    ax.add_patch(Rectangle((x0, y_safe), w, y0 + h - y_safe, facecolor="#fee2e2", edgecolor="none", alpha=0.95))
+
+    # marcador strain (escala 0..0.60)
+    frac = clamp(s / 0.60, 0.0, 1.0)
+    ym = y0 + h*frac
+    ax.plot([x0-0.01, x0+w+0.01], [ym, ym], lw=3.0, color="#111827")
+
+    # texto
+    ax.text(x0 + w/2, y0 + h + 0.03, "STRAIN", ha="center", va="bottom", fontsize=11, weight="bold")
+    ax.text(x0 + w/2, y0 - 0.04, f"{s:.2f}", ha="center", va="top",
+            fontsize=11, weight="bold", color="#166534" if s <= safe else "#991b1b")
+    ax.text(x0 - 0.01, y_safe, "limite\nseguro", ha="right", va="center", fontsize=9, color="#374151")
+
+def panel_box(ax, x, y, text, fontsize=12, fc="#ffffff", ec="#e5e7eb",
+              weight="normal", color="#111827", pad=0.35, alpha=0.95, va="top"):
+    ax.text(
+        x, y, text, transform=ax.transAxes,
+        ha="left", va=va, fontsize=fontsize, weight=weight, color=color,
+        bbox=dict(boxstyle=f"round,pad={pad}", facecolor=fc, edgecolor=ec, alpha=alpha)
+    )
+
+def draw_lung(ax, center=(0.58, 0.45), scale=1.0, pulse=0.0, crack=False):
+    cx, cy = center
+    # “pulso” suave (insp/exp)
+    s = scale * (1.0 + 0.06*pulse)
+
+    if LUNG is not None:
+        # desenhar imagem com extent controlado
+        w = 0.34*s
+        h = 0.44*s
+        ax.imshow(LUNG, extent=(cx-w/2, cx+w/2, cy-h/2, cy+h/2), zorder=2)
+    else:
+        # fallback simples (nunca devia acontecer se o ficheiro existir)
+        ax.add_patch(plt.Circle((cx-0.06*s, cy), 0.10*s, color="#f4a7b9", ec="#7f1d1d", lw=2))
+        ax.add_patch(plt.Circle((cx+0.06*s, cy), 0.10*s, color="#f4a7b9", ec="#7f1d1d", lw=2))
+
+    # “fissura” didática quando crack=True
+    if crack:
+        ax.plot([cx-0.07, cx+0.08], [cy+0.04, cy-0.10], color="#111827", lw=3.0, zorder=5)
+        ax.plot([cx-0.02, cx+0.10], [cy+0.02, cy-0.06], color="#111827", lw=2.0, zorder=5)
+
+# =========================
+# RENDER
+# =========================
+fig = plt.figure(figsize=(W, H), dpi=DPI)
 writer = imageio.get_writer(
-    OUT, fps=FPS, codec="libx264", macro_block_size=1,
-    ffmpeg_params=["-preset", "veryfast", "-crf", "22"]
+    OUT,
+    fps=FPS,
+    codec="libx264",
+    macro_block_size=1,
+    ffmpeg_params=["-preset", "ultrafast", "-crf", "24"]
 )
 
 total_frames = int(DURATION_S * FPS)
 
 for i in range(total_frames):
     t = i / FPS
-    ph = phase(t)
 
-    # -------------------------
-    # Parâmetros por fase
-    # -------------------------
-    if ph == "ok":
-        crf = CRF_OK_L
-        banner = "Pulmão saudável:\nCRF alta → strain baixo (seguro)"
-        rupture = 0.0
-        vni_note = ""
-    elif ph == "low":
-        crf = CRF_LOW_L
-        banner = "CRF baixa:\nmesmo VT → strain sobe (lesão provável)"
-        rupture = smooth01((t - 20) / 20)
-        vni_note = ""
+    # ciclo respiratório (pulso visual)
+    resp_phase = (t % 4.0) / 4.0
+    pulse = np.sin(2*np.pi*resp_phase) * 0.5 + 0.5  # 0..1
+
+    # escolher cenário por tempo
+    if t < T1:
+        # saudável
+        v0 = CRF_HEALTHY
+        s = strain(VT_L, v0)
+        crack = False
+        headline = "Pulmão saudável"
+        msg = "CRF alta → para o mesmo VT → strain baixo (seguro)"
+        msg_fc = "#dcfce7"
+        msg_col = "#166534"
+    elif t < T2:
+        # CRF baixa (lesão provável)
+        v0 = CRF_LOW
+        s = strain(VT_L, v0)
+        crack = (t > (T1 + 7.0))  # começa a “fissura” após alguns segundos
+        headline = "Pulmão com CRF baixa"
+        msg = "CRF baixa → para o mesmo VT → strain sobe (lesão provável)"
+        msg_fc = "#fee2e2"
+        msg_col = "#991b1b"
     else:
-        crf = CRF_LOW_L + 0.8 * smooth01((t - 40) / 20)
-        banner = "Com VNI:\n↑CRF efectiva → ↓strain (mesmo VT)"
-        rupture = 0.0
-        vni_note = "VNI (PEEP/recrutamento) ↑V0 → strain = ΔV/V0 desce"
+        # VNI melhora CRF (transição suave até target)
+        k = smoothstep((t - T2) / (T3 - T2))
+        v0 = lerp(CRF_LOW, CRF_VNI_TARGET, k)
+        s = strain(VT_L, v0)
+        crack = False
+        headline = "VNI: recruta + aumenta CRF"
+        msg = "Ao subir CRF (V0), o mesmo VT gera menos strain → menor risco mecânico"
+        msg_fc = "#dcfce7"
+        msg_col = "#166534"
 
-    # strain "médio" do slide (VT fixo / CRF)
-    st_mean = strain(VT_L, crf)
+    # stress (muito simplificado) só para ligação conceptual
+    # (didático): stress ∝ strain
+    stress_rel = 1.0 * s
 
-    # -------------------------
-    # Tidal (VT instantâneo) -> isto faz a barra mexer
-    # -------------------------
-    # 0.25 Hz (~15/min) só para vida visual
-    tidal = 0.5 + 0.5*np.sin(2*np.pi*(t*0.25))
-    # VT(t) oscila entre 35% e 100% do VT
-    vt_inst = VT_L * (0.35 + 0.65*tidal)
-    st_inst = strain(vt_inst, crf)  # <-- ESTE é o que move a barra
-
-    # Escala do pulmão (visível)
-    base_scale = 0.78 + 0.18*(crf / CRF_OK_L)
-    inflate_amp = 0.14 * (vt_inst / VT_L)
-    scale = base_scale + inflate_amp
-
-    # -------------------------
-    # FIG
-    # -------------------------
-    fig = plt.figure(figsize=(W, H), dpi=DPI)
-    ax = fig.add_axes([0, 0, 1, 1])
-    ax.set_axis_off()
+    fig.clf()
+    ax = fig.add_subplot(1, 1, 1)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
+    ax.axis("off")
 
     # Título
-    ax.text(0.5, 0.93, "STRESS–STRAIN — CRF e papel da VNI",
-            ha="center", va="center", fontsize=22, weight="bold", color="#111827")
+    ax.text(0.06, 0.93, "STRESS–STRAIN — CRF e o papel da VNI",
+            fontsize=18, weight="bold", ha="left", va="center", color="#111827")
 
-    # -------------------------
-    # BLOCO ESQUERDO (fixo e estreito -> não invade pulmão)
-    # -------------------------
-    ax.text(0.08, 0.83, "Definição:", fontsize=14, weight="bold", color="#111827")
-    ax.text(0.08, 0.79, r"$\mathrm{strain}=\Delta V/V_0$",
-            fontsize=18, color="#111827")
+    # =========================
+    # PAINEL ESQUERDO (BLOCO) — TUDO preso ao X_PANEL
+    # =========================
+    y = Y_TOP
+    panel_box(ax, X_PANEL, y, f"{headline}", fontsize=14, weight="bold", fc="#ffffff", ec="#e5e7eb", pad=0.40); y -= 0.10
 
-    ax.text(0.08, 0.72, f"V0 (CRF) = {crf:.1f} L", fontsize=15, color="#111827")
-    ax.text(0.08, 0.67, f"ΔV (VT) = {VT_L:.2f} L (450 mL)", fontsize=15, color="#111827")
-
-    st_col_mean = "#166534" if st_mean <= SAFE_LIMIT else "#b91c1c"
-    st_col_inst = "#166534" if st_inst <= SAFE_LIMIT else "#b91c1c"
-
-    ax.text(0.08, 0.62, f"strain (médio) = {st_mean:.2f}",
-            fontsize=16.5, weight="bold", color=st_col_mean)
-
-    ax.text(0.08, 0.58, f"strain (inst.) = {st_inst:.2f}",
-            fontsize=12.5, weight="bold", color=st_col_inst)
-
-    # Caixa cinzenta (curta, 2 linhas, e com WRAP)
-    ax.text(
-        0.08, 0.50, banner,
-        fontsize=12.5,
-        bbox=dict(boxstyle="round,pad=0.35", facecolor="#f3f4f6", edgecolor="#e5e7eb"),
-        color="#111827",
-        ha="left", va="center",
-        wrap=True
+    # Definição curta e explícita (sem confusão)
+    # V0 aqui é CRF (proxy didático)
+    def_text = (
+        "Definição:\n"
+        "strain = ΔV / V0\n"
+        f"V0 (≈ CRF) = {v0:.1f} L\n"
+        f"ΔV (VT)    = {VT_L:.2f} L (450 mL)\n"
+        f"⇒ strain   = {s:.2f}"
     )
+    panel_box(ax, X_PANEL, y, def_text, fontsize=12.5, fc="#ffffff", ec="#e5e7eb", pad=0.45); y -= 0.26
 
-    if vni_note:
-        ax.text(
-            0.08, 0.43, vni_note,
-            fontsize=12.0,
-            bbox=dict(boxstyle="round,pad=0.30", facecolor="#ecfeff", edgecolor="#a5f3fc"),
-            color="#0f172a",
-            ha="left", va="center",
-            wrap=True
-        )
-
-    # -------------------------
-    # BARRA DO STRAIN (direita) - agora mexe com st_inst
-    # -------------------------
-    x0, y0, wbar, hbar = 0.87, 0.20, 0.06, 0.62
-    ax.add_patch(Rectangle((x0, y0), wbar, hbar, fill=False, lw=2, ec="#111827"))
-
-    safe_frac = float(np.clip(SAFE_LIMIT / ST_MAX_BAR, 0, 1))
-    ax.add_patch(Rectangle((x0, y0), wbar, hbar*safe_frac, fc="#dcfce7", ec="none"))
-    ax.add_patch(Rectangle((x0, y0+hbar*safe_frac), wbar, hbar*(1-safe_frac), fc="#fee2e2", ec="none"))
-
-    ax.text(x0 + wbar/2, y0 + hbar + 0.04, "STRAIN", ha="center", fontsize=12, weight="bold")
-
-    # marcador usa strain instantâneo
-    st_clip = float(np.clip(st_inst, 0, ST_MAX_BAR))
-    ymark = y0 + hbar*(st_clip / ST_MAX_BAR)
-    ax.plot([x0-0.01, x0+wbar+0.01], [ymark, ymark], lw=3, color="#111827")
-
-    ax.text(x0 + wbar/2, y0 - 0.05, f"{st_mean:.2f}", ha="center",
-            fontsize=12, weight="bold", color=st_col_mean)
-
-    # -------------------------
-    # Badge CRF
-    # -------------------------
-    ax.text(
-        0.54, 0.12,
-        f"CRF = {crf:.1f} L",
-        ha="center", fontsize=16, weight="bold",
-        bbox=dict(boxstyle="round,pad=0.35", facecolor="#ecfeff", edgecolor="#a5f3fc"),
-        color="#0f172a"
+    # Ligação stress–strain (simples, sem equações extra)
+    link_text = (
+        "Relação chave (didática):\n"
+        "• CRF (V0) ↓  → strain ↑ (para o mesmo VT)\n"
+        "• stress ↑ quando strain ↑ (maior distensão → maior tensão)\n"
+        "• risco mecânico sobe quando CRF está reduzida"
     )
+    panel_box(ax, X_PANEL, y, link_text, fontsize=11.2, fc="#f8fafc", ec="#e5e7eb", pad=0.40); y -= 0.23
 
-    # -------------------------
-    # PULMÃO (centro) — ligeiramente mais à direita para ficar “limpo”
-    # -------------------------
-    cx, cy = 0.58, 0.47
-    target_h = 0.44 * scale
-    target_w = target_h * aspect
-    x1, x2 = cx - target_w/2, cx + target_w/2
-    y1, y2 = cy - target_h/2, cy + target_h/2
+    # Mensagem (sem sobreposição) — caixa própria
+    panel_box(ax, X_PANEL, y, msg, fontsize=12.2, fc=msg_fc, ec=msg_fc, pad=0.45, weight="bold", color=msg_col); y -= 0.10
 
-    ax.imshow(lung_img, extent=[x1, x2, y1, y2], zorder=3)
+    # Rodapé curto só no bloco esquerdo
+    if t >= T2:
+        vni_text = "VNI ↑CRF (recrutamento/PEEP) → V0 ↑ → strain ↓ → menor stress"
+        panel_box(ax, X_PANEL, y, vni_text, fontsize=11.0, fc="#eef2ff", ec="#c7d2fe", pad=0.40, color="#1e3a8a"); y -= 0.10
 
-    # Ruptura visual (fase low)
-    if rupture > 0:
-        ax.plot([cx-0.07, cx+0.04], [cy+0.08, cy-0.02], color="#111827", lw=3, zorder=4)
-        ax.plot([cx-0.01, cx+0.09], [cy+0.01, cy-0.10], color="#111827", lw=3, zorder=4)
+    # =========================
+    # Pulmão (centro)
+    # =========================
+    # Escala e pulso: mais “dramático” quando CRF baixa
+    base_scale = 1.0 if t < T1 else (0.92 if t < T2 else 0.98)
+    # pulso relativo ao strain (para “ver” mais deformação quando strain alto)
+    pulse_gain = clamp(s / 0.45, 0.4, 1.2)
+    draw_lung(ax, center=(0.60, 0.48), scale=base_scale, pulse=pulse * pulse_gain, crack=crack)
 
-        ax.text(
-            0.55, 0.23,
-            "strain excessivo → falha estrutural provável",
-            ha="center", fontsize=14, weight="bold",
-            color="#b91c1c",
-            bbox=dict(boxstyle="round,pad=0.35", facecolor="#fee2e2", edgecolor="#fecaca"),
-            zorder=5
-        )
+    # Etiqueta CRF (no centro inferior, não colide)
+    ax.text(0.60, 0.18, f"CRF = {v0:.1f} L",
+            ha="center", va="center", fontsize=13, weight="bold",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="#e0f2fe", edgecolor="#bae6fd", alpha=0.98),
+            color="#111827")
 
-    # -------------------------
-    # Frame -> vídeo
-    # -------------------------
-    fig.canvas.draw()
-    frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
-    writer.append_data(frame)
-    plt.close(fig)
+    # =========================
+    # Barra STRAIN (direita) — agora move sempre
+    # =========================
+    draw_strain_bar(ax, s, x0=BAR_X0, y0=BAR_Y0, w=BAR_W, h=BAR_H, safe=SAFE_STRAIN)
+
+    # “Semáforo” rápido em baixo (curto, sem caixas a colidir)
+    if s <= SAFE_STRAIN:
+        sem_text = "strain dentro do limite (reversível)"
+        sem_fc, sem_ec, sem_col = "#dcfce7", "#bbf7d0", "#166534"
+    else:
+        sem_text = "strain excessivo (lesão provável)"
+        sem_fc, sem_ec, sem_col = "#fee2e2", "#fecaca", "#991b1b"
+
+    ax.text(0.86, 0.14, sem_text, ha="center", va="center",
+            fontsize=11, weight="bold",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor=sem_fc, edgecolor=sem_ec, alpha=0.98),
+            color=sem_col)
+
+    fig.tight_layout()
+    writer.append_data(canvas_to_rgb(fig))
 
 writer.close()
 print("OK ->", OUT)
